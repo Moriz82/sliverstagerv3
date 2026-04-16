@@ -1,0 +1,23 @@
+# Local engagement config — never commit
+.sliverstagerv3.config
+*.env
+
+# Build output / payloads
+output/
+stage.exe
+*.exe
+*.bin
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

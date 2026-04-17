@@ -1,145 +1,123 @@
 # sliverstagerv3
 
-New V3 stager project for the CCDC engagement flow with:
+Windows stager for a Sliver C2 beacon. Downloads, decrypts, and launches a
+second-stage beacon from a remote URL; optionally installs persistence and
+a watchdog.
 
-- macOS CLI GUI builder (`remote-build.sh`) that drives Windows-hosted MSVC builds over SSH/SCP
-- Remote Windows build script (`build-remote.bat`) with Server 2019/2022 VS discovery
-- Updated stager runtime (`src/main_stager.c`) with explicit SYSTEM/user spawn mode and persistence/watchdog controls
-- CCDC helper scripts for controlled non-destructive service downtime and restore
+> Research / authorized-engagement use only.
 
-## Quick start
+## What the stager does
+
+A single x86-64 Windows PE (`stager-v3.exe`) built from `src/main_stager.c`:
+
+1. **Fetch.** Uses WinInet to GET the stage-2 blob from `STAGE2_URL`.
+2. **Decrypt.** Accepts two payload formats:
+   - `SLVRSTG1` headered format produced by `encrypt.py` (header + embedded
+     key bytes + padding metadata). Default.
+   - Raw XOR with a compile-time `STAGE2_XOR_KEY` (legacy).
+3. **Spawn.** Runs the decrypted PE in one of two contexts based on
+   `STAGE_SPAWN_MODE`:
+   - `user` — execute as the current user. No token work.
+   - `system` — steal a SYSTEM token and launch from a SYSTEM context.
+     Implemented in `token_utils.{c,h}`. Configurable strictness, optional
+     fallback to user, optional in-process reflective fallback.
+4. **Execute.** PE is launched via process-hollowing (diskless) by default.
+   Disk-staged execution is gated behind
+   `STAGE_ALLOW_DISK_STAGED_EXECUTION`.
+5. **Persist (optional).** `STAGE_PERSISTENCE` + `STAGE_PERSISTENCE_MODE`:
+   - `0` — none
+   - `1` — SYSTEM service (`WaaSUpdateMonitorSvc` name by default)
+   - `2` — scheduled task
+   - `3` — both
+   Implementation in `persistence.{c,h}`. Legacy artifact names are removed
+   on install.
+6. **Watchdog (optional).** `STAGE_WATCHDOG=1` installs a scheduled
+   relaunch task under `\Microsoft\Windows\UpdateOrchestrator\Watchdog` to
+   re-spawn the beacon if it dies. Implementation in `watchdog.{c,h}`.
+
+All runtime behavior is controlled via compile-time `#define`s, injected
+into a temporary copy of `main_stager.c` by the build driver. Defaults live
+at the top of `main_stager.c`; per-build values come from
+`.sliverstagerv3.config`.
+
+### Relevant source files
+
+| File | Role |
+|---|---|
+| `src/main_stager.c` | Entry point, fetch + decrypt + spawn orchestration |
+| `src/token_utils.c/h` | SYSTEM token acquisition + context switching |
+| `src/persistence.c/h` | Service + scheduled task install/uninstall |
+| `src/watchdog.c/h` | Relaunch watchdog scheduled task |
+| `syscalls-x64.asm` | Direct syscalls (`STAGE_USE_SYSCALLS=1`) |
+| `encrypt.py` | Builds `SLVRSTG1`-headered encrypted payloads |
+
+## Build pipeline
+
+Builds run on a remote Windows host because the stager uses MSVC-specific
+intrinsics and COM / syscall paths. The local driver is `remote-build.sh`
+(macOS/Linux); the remote compile runs under `build-remote.bat` on the
+Windows host.
+
+```
+local (mac/linux)                remote (windows + MSVC)
+┌─────────────────┐   ssh/scp    ┌────────────────────────┐
+│ remote-build.sh │ ───────────▶ │ build-remote.bat       │
+│  reads config   │              │  discovers VS 2019/22  │
+│  injects #defs  │              │  compiles main_stager  │
+│  uploads src    │              │  links syscalls-x64    │
+│                 │ ◀─────────── │  writes stager-v3.exe  │
+└─────────────────┘   scp back   └────────────────────────┘
+```
+
+1. `remote-build.sh` loads `.sliverstagerv3.config`, validates required
+   values (refuses to run if any are empty).
+2. Injects `STAGE2_URL`, `STAGE2_XOR_KEY`, and the spawn / persistence /
+   watchdog flags as `/D` macros into a scratch copy of `main_stager.c`.
+3. `scp`s sources + `build-remote.bat` to the Windows host.
+4. Invokes `build-remote.bat` over SSH. The batch file discovers VS
+   (2019 or 2022, Server SKU or Desktop) and runs `cl.exe` + `ml64.exe`.
+5. Pulls the resulting `stager-v3.exe` back into `output/`.
+
+### Setup
 
 ```bash
 cp .sliverstagerv3.config.example .sliverstagerv3.config
-# edit .sliverstagerv3.config and fill in real values for your lab
+# edit .sliverstagerv3.config and fill in real values
 chmod +x remote-build.sh
 ./remote-build.sh
 ```
 
-Config is read from `./.sliverstagerv3.config` (gitignored).
+Required config keys — all must be set (real config is gitignored):
 
-## Mandatory config values
+- `WIN_VM_IP`, `WIN_USER`, `WIN_SSH_PASSWORD` — remote build host
+- `C2_DOMAIN`, `C2_PORT`, `STAGE2_URL` — second-stage location
+- `XOR_KEY` — 32-byte hex, fresh per build (`openssl rand -hex 16`)
+- `STAGE_SPAWN_MODE`, `STAGE_PERSISTENCE`, `STAGE_WATCHDOG`, … — runtime
+  behavior flags (see `.sliverstagerv3.config.example` for the full list)
 
-Fill these in `.sliverstagerv3.config`. The builder refuses to run if any
-required value is empty or a placeholder.
-
-- `WIN_VM_IP` — Windows build host IP
-- `WIN_USER` — SSH user on the build host
-- `WIN_SSH_PASSWORD` — SSH password (or use key-based auth)
-- `C2_DOMAIN` — C2 listener host
-- `C2_PORT` — C2 listener port
-- `STAGE2_URL` — full URL the stager fetches the beacon from
-- `STAGE2_BEACON_NAME` — beacon filename (default `stage.exe`)
-- `STAGE2_ENCRYPTED_NAME` — encrypted output path (default `output/stage-encrypted.bin`)
-- `XOR_KEY` — 32-byte hex key. Generate fresh per engagement: `openssl rand -hex 16`
-- `STAGE_PERSISTENCE=1` (persistence enabled)
-- `STAGE_PERSISTENCE_MODE=service` (default service-backed profile with a SYSTEM service)
-- `STAGE_WATCHDOG=1`
-
-## remote-build.sh usage
-
-Interactive menu:
-
-- Build now (full pipeline)
-- Build-only (compile on VM only)
-- Settings + persistence/watchdog toggles
-- Encrypt local beacon (`encrypt.py`)
-
-Non-interactive:
+### Driver usage
 
 ```bash
-./remote-build.sh build --mode system --verbose --persistence both --watchdog
-./remote-build.sh build --mode user --quiet --persistence off
-./remote-build.sh build-only --watchdog --no-watchdog
-./remote-build.sh test
-./remote-build.sh plan
+./remote-build.sh                                          # interactive menu
+./remote-build.sh build --mode system --persistence both   # system + both persistence
+./remote-build.sh build --mode user --persistence off      # user, no persistence
+./remote-build.sh build-only --watchdog                    # compile only
+./remote-build.sh test                                     # SSH + toolchain sanity
+./remote-build.sh plan                                     # print resolved config
 ```
 
-## Build pipeline
-
-`remote-build.sh` performs:
-
-1. Validate SSH/build tool prerequisites
-2. Test and setup remote build folders (`C:\SliverStagerBuilds`)
-3. Inject updated C macros in a temporary local copy (`windows-stager-build.c`)
-4. Upload `windows-stager.c`, `syscalls-x64.asm`, and helper modules to VM
-5. Compile via `build-remote.bat` on VM with `STAGE2_URL`, `XOR_KEY`, and mode flags
-6. Download compiled `output/stager-v3.exe`
-
-## Build options
-
-- `STAGE_SPAWN_MODE=system`:
-  - `STAGE_SYSTEM_INJECTION=1`
-  - `STAGE_SYSTEM_STRICT=1`
-  - `STAGE_SYSTEM_FALLBACK_TO_USER=0`
-  - `STAGE_SYSTEM_PROCESS_HOLLOWING_ENABLED=1` (default for diskless launch)
-  - `STAGE_ALLOW_DISK_STAGED_EXECUTION=0` (enable with `--disk-staged` only when explicitly needed)
-- `STAGE_SYSTEM_INPROCESS_REFLECTIVE_FALLBACK=0` in strict/system-default profile
-- `STAGE_SPAWN_MODE=user`:
-  - `STAGE_SYSTEM_INJECTION=0`
-  - no SYSTEM token paths are attempted
-- `STAGE_PERSISTENCE_MODE`
-  - `off` (0) -> no persistence
-- `service` (1) -> SYSTEM service profile (`WaaSUpdateMonitorSvc`) with periodic launch checks from the same persistence mechanism
-  - legacy `SliverStagerV3Service` artifacts are removed during install.
-  - `task` (2)
-  - `both` (3)
-- `STAGE_WATCHDOG=1` installs scheduled watchdog task (`\\Microsoft\\Windows\\UpdateOrchestrator\\Watchdog`) for relaunch checks
-  - legacy `SliverStageV3Watchdog` artifacts are removed during install.
-  - default saved config now enables `service` persistence (`STAGE_PERSISTENCE=1`, `STAGE_PERSISTENCE_MODE=1`) and watchdog
-
-Runtime note:
- - `STAGE_SYSTEM_PROCESS_HOLLOWING_ENABLED` defaults to `1` for SYSTEM builds.
- - `STAGE_SYSTEM_INPROCESS_REFLECTIVE_FALLBACK` defaults to `0` when `system` strict mode is active.
-- `STAGE_SYSTEM_LOCAL_SERVICE_LAUNCH` defaults to `0` to avoid flaky LocalSystem service launcher paths.
-
-## Beacon prep and payload formats
-
-The stager supports two download formats:
-
-1) Preferred headered format `SLVRSTG1`:
-
-- Generated by `encrypt.py` format that writes header + embedded key bytes + padding metadata.
-- Recommended default.
-
-2) Raw XOR fallback:
-
-- Plain raw XOR payload (legacy format) is also supported.
-- Useful for compatibility with older beacon workflows.
-
-### Recommended flow
+### Beacon prep
 
 ```bash
 python3 encrypt.py stage.exe stage-encrypted.bin --key "$XOR_KEY"
+# host output/stage-encrypted.bin at STAGE2_URL
 ```
 
-- Keep the encrypted payload at `output/stage-encrypted.bin` (or custom name in config).
-- Host over HTTP so `STAGE2_URL` is reachable from the target.
-- PE payloads are executed through SYSTEM/USER process launch paths, not thread/APC injection.
-  - If you still see `Standalone fallback disabled. Proceeding to reflective fallback.` that is expected for older builds and indicates a version mismatch.
-- Switching to non-PE raw payloads is optional and only useful if you specifically want memory-only execution; it is not required for the default workflow.
+## Files
 
-## CCDC helper scripts
-
-- `ccdc_service_downtime.ps1`  
-  Capture approved services, stop them, and disable startup for temporary downtime.
-  Supports `-DryRun`, `-StateFile`, and optional timeout restore scheduling.
-
-- `ccdc_service_restore.ps1`  
-  Restore captured startup mode and running state from JSON file.
-
-## File list
-
-- `remote-build.sh`
-- `build-remote.bat`
-- `src/main_stager.c`
-- `src/token_utils.c` / `src/token_utils.h`
-- `src/persistence.c` / `src/persistence.h`
-- `src/watchdog.c` / `src/watchdog.h`
-- `encrypt.py`
+- `remote-build.sh`, `build-remote.bat` — build drivers
+- `src/main_stager.c` + `src/token_utils.*` + `src/persistence.*` + `src/watchdog.*`
 - `syscalls-x64.asm`
-
-### Notes
-
-- `output/stager-v3.exe` is the build artifact name.
-- This project is intended for authorized CCDC exercise usage only; helper downtime scripts are non-destructive and stateful for clean recovery.
+- `encrypt.py`
+- `.sliverstagerv3.config.example` — config template (real config is
+  gitignored)
